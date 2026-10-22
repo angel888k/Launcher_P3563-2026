@@ -66,7 +66,7 @@ namespace RiderData
                 oPacket.WriteUInt(riderDataConfig.Rider.Lucci);
                 oPacket.WriteUInt(riderDataConfig.Rider.RP);
                 oPacket.WriteBytes(new byte[94]);
-                oPacket.WriteBytes(new byte[215]);
+                oPacket.WriteUInt(0);
                 Parent.Client.Send(oPacket);
             }
         }
@@ -209,14 +209,6 @@ namespace RiderData
                                 items.Add(add);
                             }
                             else
-                            {
-                                List<ushort> add = new List<ushort> { (ushort)id, (ushort)sn, num };
-                                items.Add(add);
-                            }
-                        }
-                        else if (itemCatId == 14)
-                        {
-                            if (id == 22 || id == 23 || id == 31 || id == 37 || id == 53 || id == 57 || id == 99)
                             {
                                 List<ushort> add = new List<ushort> { (ushort)id, (ushort)sn, num };
                                 items.Add(add);

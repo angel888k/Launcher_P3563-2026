@@ -948,6 +948,16 @@ namespace KartRider
                                 }
                             }
                         }
+                        if (fullName == $"zeta_/{regionCode}/content/mix/mixTable.xml")
+                        {
+                            Console.WriteLine(fullName);
+                            byte[] data = packFileInfo.GetData();
+                            using (MemoryStream stream = new MemoryStream(data))
+                            {
+                                XDocument doc = XDocument.Load(stream);
+                                Mix.ParseDocument(doc);
+                            }
+                        }
                     }
                     foreach (PackFolderInfo packFolderInfo2 in packFolderInfo1.GetFoldersInfo())
                         packFolderInfoQueue.Enqueue(packFolderInfo2);

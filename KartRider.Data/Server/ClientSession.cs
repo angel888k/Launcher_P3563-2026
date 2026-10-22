@@ -13,6 +13,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Text;
+using System.Windows.Forms.Design;
 using System.Xml;
 using System.Xml.Linq;
 
@@ -2254,6 +2255,15 @@ namespace KartRider
                             outPacket.WriteUInt(ProfileService.GetProfileConfig(this.Parent.Client.Nickname).Rider.Cash);
                             this.Parent.Client.Send(outPacket);
                         }
+                        using (OutPacket outPacket = new OutPacket("SpRpRemainTcCashPacket"))
+                        {
+                            outPacket.WriteUInt(99);
+                            outPacket.WriteUInt(ProfileService.GetProfileConfig(this.Parent.Client.Nickname).Rider.TcCash);
+                            outPacket.WriteUInt(0);
+                            outPacket.WriteUInt(0);
+                            outPacket.WriteUInt(0);
+                            this.Parent.Client.Send(outPacket);
+                        }
                         return;
                     }
                     else if (hash == Adler32Helper.GenerateAdler32_ASCII("SpRqRemainTcCashPacket", 0))
@@ -3075,11 +3085,9 @@ namespace KartRider
                     }
                     else if (hash == Adler32Helper.GenerateAdler32_ASCII("PqMixItem", 0))
                     {
-                        using (OutPacket outPacket = new OutPacket("PrMixItem"))
-                        {
-                            outPacket.WriteInt(0);
-                            this.Parent.Client.Send(outPacket);
-                        }
+                        uint MixID = iPacket.ReadUInt();
+                        int Type = iPacket.ReadInt();
+                        Mix.GrtMixItem(this.Parent, MixID, Type);
                         return;
                     }
                     else if (hash == Adler32Helper.GenerateAdler32_ASCII("RqBoomhillExchangeKoin", 0))
@@ -3959,6 +3967,14 @@ namespace KartRider
                             outPacket.WriteInt(1);
                             this.Parent.Client.Send(outPacket);
                         }
+                        return;
+                    }
+                    else if (hash == Adler32Helper.GenerateAdler32_ASCII("PqUseItemAccumCard", 0))
+                    {
+                        ushort itemCatId = iPacket.ReadUShort();
+                        ushort itemId = iPacket.ReadUShort();
+                        ushort count = iPacket.ReadUShort();
+                        Stock.ItemAccumCard(this.Parent, itemCatId, itemId, count);
                         return;
                     }
                     else if (hash == Adler32Helper.GenerateAdler32_ASCII("PqQuestUX2ndForShutDownPacket", 0))

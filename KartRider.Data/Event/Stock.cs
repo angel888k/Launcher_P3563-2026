@@ -14,6 +14,29 @@ namespace KartRider
         // key为stockId，value为该stock下的item列表
         public static Dictionary<uint, List<item>> StockList = new Dictionary<uint, List<item>>();
         public static Dictionary<uint, price> PriceList = new Dictionary<uint, price>();
+        public static Dictionary<ushort, uint> LucciList = new Dictionary<ushort, uint>
+        {
+            { 1, 100 },
+            { 2, 500 },
+            { 3, 1000 },
+            { 4, 5000 },
+            { 5, 10000 },
+            { 7, 100000 },
+            { 9, 200 },
+            { 10, 300 },
+            { 13, 1000 },
+            { 14, 2000 },
+            { 15, 3000 },
+            { 16, 5000 },
+            { 17, 10000 },
+            { 18, 20000 },
+            { 19, 30000 },
+            { 20, 50000 },
+            { 21, 100000 },
+            { 22, 500000 },
+            { 23, 1000000 },
+            { 24, 5000000 }
+        };
 
         /**
          * 尝试获取指定stockId的item列表
@@ -254,7 +277,13 @@ namespace KartRider
                     endTime = Item.expireDay == 0 ? DateTime.MinValue : DateTime.Now.AddDays(Item.expireDay)
                 });
 
-                if (Item.itemCatId == 3)
+                if (Item.itemCatId == 56 && Item.itemId == 1)
+                {
+                    var KoinConfig = ProfileService.GetProfileConfig(Nickname);
+                    KoinConfig.Rider.Koin = (uint)Math.Min((long)(KoinConfig.Rider.Koin + Item.itemCount), uint.MaxValue);
+                    ProfileService.Save(Nickname, KoinConfig);
+                }
+                else if (Item.itemCatId == 3)
                 {
                     byte Grade = Kart.kartName.GetValueOrDefault(Item.itemId)?.grade ?? 0;
                     var kart = new KartSpec();
@@ -338,6 +367,25 @@ namespace KartRider
                 }
                 File.WriteAllText(filename.NewItem_LoadFile, JsonHelper.Serialize(newitem));
             }
+        }
+
+        public static void ItemAccumCard(SessionGroup Parent, ushort itemCatId, ushort itemId, ushort count)
+        {
+            var LucciConfig = ProfileService.GetProfileConfig(Parent.Client.Nickname);
+            var AddLucci = LucciList.GetValueOrDefault(itemId, (uint)0) * count;
+            LucciConfig.Rider.Lucci = (uint)Math.Min((long)(LucciConfig.Rider.Lucci + AddLucci), uint.MaxValue);
+            using (OutPacket outPacket = new OutPacket("PrUseItemAccumCard"))
+            {
+                outPacket.WriteByte(0);
+                outPacket.WriteUShort(itemCatId);
+                outPacket.WriteUShort(itemId);
+                outPacket.WriteUShort(count);
+                outPacket.WriteUInt(LucciConfig.Rider.Lucci);
+                outPacket.WriteUInt(AddLucci);
+                Parent.Client.Send(outPacket);
+            }
+            ProfileService.Save(Parent.Client.Nickname, LucciConfig);
+            DelNewItem(Parent.Client.Nickname, itemCatId, itemId, count);
         }
     }
 
