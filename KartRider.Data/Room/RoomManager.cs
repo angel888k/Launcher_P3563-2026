@@ -300,6 +300,8 @@ public static class RoomManager
     {
         if (!_rooms.TryGetValue(roomId, out var room))
             return false;
+        if (room.DuoTeam)
+            return ChangeDuoTeam(room, slotId, team);
         if (team == 2)
         {
             for (int i = 0; i < 4; i++)
@@ -367,6 +369,54 @@ public static class RoomManager
             }
         }
         return false;
+    }
+
+    // 双人组队换队：把成员移动到目标队伍的空格子上。
+    // 目标队伍已满时拒绝（保持原队伍），避免单支队伍超过「每队人数」，破坏双人分队的配对关系。
+    private static bool ChangeDuoTeam(GameRoom room, byte slotId, byte team)
+    {
+        var member = room.GetSlotMember(slotId);
+        if (member == null)
+            return false;
+
+        // 队伍号不在 1..TeamCount 范围内（客户端偶尔会发 0 或越界值）：保持原队伍。
+        // 双人组队房间的队伍号是 1..4（官方抓包中客户端会直接发 GrChangeTeamPacket = 4）
+        if (!room.IsValidTeam(team))
+            return false;
+
+        int start = room.TeamSlotStart(team);
+        int end = Math.Min(8, start + room.TeamSlotCount(team));
+
+        // 已经在本队伍范围内：只刷新队伍号
+        if (slotId >= start && slotId < end)
+        {
+            ApplyDuoPlacement(member, team, slotId);
+            return true;
+        }
+
+        for (int i = start; i < end; i++)
+        {
+            if (room._slots[i] == null)
+            {
+                if (!room.ChangeSlotId(slotId, (byte)i))
+                    return false;
+                ApplyDuoPlacement(member, team, (byte)i);
+                return true;
+            }
+        }
+
+        Console.WriteLine("[DuoTeam] 队伍 {0} 已满（{1}/{2}），拒绝换队", team, room.GetTeamMemberCount(team), room.TeamSlotCount(team));
+        return false;
+    }
+
+    // 同步成员对象上的队伍号与格子号（Player / Ai 都带 Team 字段）
+    private static void ApplyDuoPlacement(RoomMember member, byte team, byte slotId)
+    {
+        member.SlotId = slotId;
+        if (member is Player player)
+            player.Team = team;
+        else if (member is Ai ai)
+            ai.Team = team;
     }
 
     public static GameRoom GetRoom(int roomId) =>

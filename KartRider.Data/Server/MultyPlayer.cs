@@ -238,15 +238,18 @@ public static class MultyPlayer
         room.TimeData = new Dictionary<int, uint>();
         room.Ranking = new Dictionary<int, int>();
         room.EndTicks = 0;
+        room.SettleTriggered = false;
         room.Ready = new Dictionary<string, bool>();
         room.Tracks = new Dictionary<int, TrackPos>(); // 新一局重置位置跟踪（坐标/圈数/里程）
+        room.AiTracks = new Dictionary<int, AiTrack>(); // 新一局重置 AI 里程跟踪
+        room.TeamGauge.Clear(); // 新一局重置各队组队加速槽
         Console.WriteLine("StartTicks = {0}", room.StartTicks);
     }
 
-    static void Set_settleTrigger(GameRoom room)
+    static void Set_settleTrigger(GameRoom room, int delayMs = 10000)
     {
         var onceTimer = new System.Timers.Timer();
-        onceTimer.Interval = 10000;
+        onceTimer.Interval = delayMs;
         onceTimer.Elapsed += new System.Timers.ElapsedEventHandler((s, _event) => settleTrigger(room, s, _event));
         onceTimer.AutoReset = false;
         onceTimer.Start();
@@ -258,18 +261,66 @@ public static class MultyPlayer
         {
             return;
         }
+        if (room.SettleTriggered)
+        {
+            return; // 已经结算过（AI 收尾倒计时 / 玩家冲线两条路径可能各挂了一个定时器）
+        }
+        room.SettleTriggered = true;
 
         var menbers = room.SnapshotMembers ?? room._IDs; // 优先用结束瞬间快照
         var timeData = new Dictionary<int, uint>(room.TimeData);
         room.SnapshotMembers = null; // 用后清除
 
+        uint settleTick = room.EndTicks + 6000;
         using (OutPacket outPacket = new OutPacket("GameControlPacket"))
         {
             outPacket.WriteInt(4);
             outPacket.WriteByte(0);
-            outPacket.WriteUInt(room.EndTicks + 6000);
+            outPacket.WriteUInt(settleTick);
             BroadCast(room.RoomId, outPacket);
         }
+
+        // 兜底：客户端偶尔读完秒会停在赛道画面不动（收到 state=4 也不切场景）。
+        // 1.8 秒后再补一次 state=4 + GameNextStagePacket，把它推去结算板；
+        // 不重发 GameResultPacket，避免重复算 RP/金币。
+        int retryRoomId = room.RoomId;
+        byte retryModeByte = room.ModeByte;
+        var resendTimer = new System.Timers.Timer(1800);
+        resendTimer.Elapsed += (s, _e) =>
+        {
+            try
+            {
+                using (OutPacket retry = new OutPacket("GameControlPacket"))
+                {
+                    retry.WriteInt(4);
+                    retry.WriteByte(0);
+                    retry.WriteUInt(settleTick);
+                    BroadCast(retryRoomId, retry);
+                }
+                using (OutPacket stage = new OutPacket("GameNextStagePacket"))
+                {
+                    stage.WriteByte(retryModeByte);
+                    stage.WriteInt();
+                    stage.WriteInt();
+                    BroadCast(retryRoomId, stage);
+                }
+                Console.WriteLine("[结算重发] 补发 state=4 + GameNextStagePacket 推动客户端进入结算板");
+            }
+            catch { }
+            finally
+            {
+                var tmr = (System.Timers.Timer)s;
+                tmr.Stop();
+                tmr.Dispose();
+            }
+        };
+        resendTimer.AutoReset = false;
+        resendTimer.Start();
+
+        // 双人组队（以及普通组队/个人）里客户端 AI 跑得比玩家慢，10 秒结算窗口内往往还没到终点，
+        // 整局 AI 的成绩都是 0xFFFFFFFF（未完赛）→ 结算板只显示玩家一行、其他队伍全 0 分。
+        // 这里在结算前给未完赛的 AI 补一个成绩，并补发 GameRaceTimePacket 让客户端也认为它们到达终点。
+        PatchMissingAiResultTimes(room, menbers, timeData);
 
         InitRoom(room);
 
@@ -286,7 +337,7 @@ public static class MultyPlayer
             room.RoomMaster = firstID;
             p2.PlayerType = 2;
         }
-        Console.WriteLine("EndTicks = {0}", room.EndTicks + 6000);
+        Console.WriteLine("EndTicks = {0}", settleTick);
     }
 
     public static void Clientsession(SessionGroup Parent, uint hash, InPacket iPacket)
@@ -338,17 +389,11 @@ public static class MultyPlayer
                 }
                 if (room.EndTicks == 0)
                 {
-                    room.SnapshotMembers = DeepCopyMembers(room._IDs); // 结束瞬间拍快照
-                    room.EndTicks = ConvertTick() + 10000;
-                    using (OutPacket oPacket = new OutPacket("GameControlPacket"))
-                    {
-                        oPacket.WriteInt(3);
-                        oPacket.WriteByte(0);
-                        oPacket.WriteUInt(room.EndTicks);
-                        BroadCast(roomId, oPacket, Parent.Client.Nickname);
-                    }
-                    Set_settleTrigger(room);
+                    // 玩家冲线：和「第一个 AI 冲线」走同一条路 —— 开始 10 秒读秒，到点就结算。
+                    BeginCountdown(room, CountdownWindowMs, "玩家到达终点");
                 }
+                // 读秒进行中有人冲线：不重新计时，也不提前结算 —— 从第一个完赛者算起固定 10 秒，
+                // 没跑完的人（AI 或玩家）一律按未完赛处理，结算前会给 AI 补成绩，结算板照样完整。
             }
             return;
         }
@@ -368,7 +413,7 @@ public static class MultyPlayer
                     oPacket.WriteString(_room.Value.RoomName); // 房间名称
                     oPacket.WriteUInt(_room.Value.track); // 赛道
                     oPacket.WriteBool(_room.Value.Lock); // 是否上锁
-                    oPacket.WriteByte(_room.Value.GameType); // 模式
+                    oPacket.WriteByte(_room.Value.ModeByte); // 模式（双人组队 = 68）
                     oPacket.WriteByte(_room.Value.SpeedType); // 速度模式
                     oPacket.WriteBool(_room.Value.Started); // 房间状态
                     oPacket.WriteByte((byte)(8 - _room.Value.CloseSlotIds.Count)); // 房间最大人数
@@ -387,7 +432,9 @@ public static class MultyPlayer
             var channelData = GameSupport.Channels.ContainsKey(channel) ? GameSupport.Channels[channel] : null;
             if (channelData == null) return;
             StartTimeAttack[Parent.Client.Nickname] = channelData.CreateSpeed;
-            Console.WriteLine("Channel Switch, channel = {0}", channelData.Name);
+            // 记录玩家当前频道：建房时若处于「双人组队」频道，则房间自动启用双人组队模式
+            GameSupport.SetPlayerChannel(Parent.Client.Nickname, channel);
+            Console.WriteLine("Channel Switch, channel = {0}, duo = {1}", channelData.Name, channelData.DuoTeam);
 
             // 获取服务器IP地址
             IPEndPoint serverIPEndPoint = GetServerEndPoint(Parent);
@@ -481,9 +528,52 @@ public static class MultyPlayer
             {
                 Room.SpeedType = 7;
             }
+            // 双人组队判定（模式号以官方抓包为准：68 = 双人组队）：
+            // 1) 玩家当前所在频道是双人组队频道（channel.xml 中 gameType 68，或服务端追加的频道）
+            //    此时无论客户端上报什么 gameType，都以频道定义的模式为准
+            // 2) 客户端直接上报 gameType 68（客户端 channel.xml 已配置该模式的频道）
+            // 3) 房间名带关键字（便于不进频道也能快速测试）
+            byte playerChannel = GameSupport.GetPlayerChannel(Parent.Client.Nickname);
+            bool inDuoChannel = GameSupport.IsDuoTeamChannel(playerChannel);
+
+            // 客户端上报的原始模式号（可能是 68，也可能是普通组队的 3/4）
+            byte rawGameType = GameType;
+            byte channelWireGameType = 0;
+            if (inDuoChannel)
+            {
+                var channelInfo = GameSupport.Channels[playerChannel];
+                rawGameType = channelInfo.GameType;
+                channelWireGameType = channelInfo.WireGameType != 0 ? channelInfo.WireGameType : DuoTeamMode.GameType;
+            }
+
+            // 判定是否双人组队：频道命中，或客户端直接上报 68，或房间名带关键字
+            bool duoTeam = inDuoChannel
+                           || DuoTeamMode.IsDuoGameType(rawGameType)
+                           || DuoTeamMode.IsDuoRoomName(RoomName);
+
+            // 服务端内部统一用组队模式的 3/4 处理（道具、结算、分队逻辑都按 3/4 判断）
+            GameType = DuoTeamMode.ToBaseGameType(rawGameType);
+
             Room.GameType = GameType;
             Room.RoomData = RoomData;
-            Console.WriteLine("CreateRoom = {0}", RoomId);
+            Room.DuoTeam = duoTeam && (GameType == 3 || GameType == 4);
+            if (Room.DuoTeam)
+            {
+                // 双人组队：客户端需要收到官方模式号 68 才会渲染多队伍房间（1~4 队可选）。
+                // 频道里显式配置了别的双人模式号时以频道为准。
+                Room.WireGameType = DuoTeamMode.IsDuoGameType(channelWireGameType)
+                    ? channelWireGameType
+                    : DuoTeamMode.ToWireGameType(GameType);
+            }
+            else
+            {
+                Room.WireGameType = GameType;
+            }
+            Room.DuoTeamSize = Room.DuoTeam
+                ? DuoTeamMode.NormalizeTeamSize(ProfileService.SettingConfig.DuoTeamSize)
+                : DuoTeamMode.DefaultTeamSize;
+            Console.WriteLine("CreateRoom = {0}, GameType = {1}, WireGameType = {2}, DuoTeam = {3}, TeamSize = {4}",
+                RoomId, Room.GameType, Room.WireGameType, Room.DuoTeam, Room.DuoTeamSize);
             byte randomTrackGameType = 0;
             if (GameType == 2 || GameType == 4 || GameType == 14 || GameType == 54)
             {
@@ -493,7 +583,9 @@ public static class MultyPlayer
 
             if (GameType == 3 || GameType == 4)
             {
-                byte slot = RoomManager.AddPlayer(RoomId, Parent.Client.Nickname, 2, 2, Parent);
+                // 双人组队按格子顺序入座（0,1 → 1 队 …）；普通组队固定进入蓝队（0-3 格）
+                byte teamArg = Room.DuoTeam ? (byte)0 : (byte)2;
+                byte slot = RoomManager.AddPlayer(RoomId, Parent.Client.Nickname, teamArg, 2, Parent);
                 if (slot == 255)
                 {
                     Console.WriteLine("CreateRoom Failed");
@@ -515,8 +607,10 @@ public static class MultyPlayer
                 {
                     oPacket.WriteByte(1);
                     oPacket.WriteByte(1);
-                    oPacket.WriteByte(2);
-                    oPacket.WriteEncByte(GameType);
+                    // 队伍数量：官方双人组队抓包为 04（4 支队伍），客户端据此生成 4 张队伍色卡片。
+                    // 原先固定写 2，导致换队面板只有红蓝两色。
+                    oPacket.WriteByte(Room.WireTeamCount);
+                    oPacket.WriteEncByte(Room.WireGameType);
                     Parent.Client.Send(oPacket);
                 }
             }
@@ -545,7 +639,7 @@ public static class MultyPlayer
                     oPacket.WriteByte(1);
                     oPacket.WriteByte(1);
                     oPacket.WriteByte(8);
-                    oPacket.WriteEncByte(GameType);
+                    oPacket.WriteEncByte(Room.WireGameType);
                     Parent.Client.Send(oPacket);
                 }
             }
@@ -872,19 +966,29 @@ public static class MultyPlayer
             }
             room.TimeData.TryAdd(Id, Time);
             Console.WriteLine("GameAiGoalinPacket, Id = {0}, Time = {1}", Id, Time);
-            if (room.EndTicks == 0)
+            // 注意：这里原来「第一个 AI 冲线就开始 10 秒倒计时」，会把还在冲刺的玩家硬判未完赛
+            // （实测玩家离终点只差 400 米，10 秒后直接弹出结算且自己 0 分）。
+            // 现在改成：等所有 AI 都到终点，再给一个收尾倒计时；玩家在这期间冲线就提前结算。
+            TryStartAiFinishCountdown(room);
+            return;
+        }
+        else if (hash == Adler32Helper.GenerateAdler32_ASCII("GameAiReportPacket"))
+        {
+            // AI 在「AI 主机」客户端本地模拟，客户端只会周期性发这个包上报 7 个 AI 的里程，
+            // 全程不发 GameAiGoalinPacket（AI 冲线包）——所以 AI 到终点这件事必须服务端自己判。
+            int roomId = RoomManager.TryGetRoomId(Parent.Client.Nickname);
+            var room = RoomManager.GetRoom(roomId);
+            if (room == null || room.StartTicks == 0)
             {
-                room.SnapshotMembers = DeepCopyMembers(room._IDs);
-                room.EndTicks = ConvertTick() + 10000;
-                using (OutPacket oPacket = new OutPacket("GameControlPacket"))
-                {
-                    oPacket.WriteInt(3);
-                    oPacket.WriteByte(0);
-                    oPacket.WriteUInt(room.EndTicks);
-                    BroadCast(roomId, oPacket);
-                }
-                Set_settleTrigger(room);
+                return;
             }
+            iPacket.Skip(4); // 浮点数组前有 4 字节无意义数据（客户端未初始化的缓冲）
+            var aiDists = new List<float>();
+            while (iPacket.Available >= 4)
+            {
+                aiDists.Add(iPacket.ReadFloat());
+            }
+            AiReportUpdate(room, aiDists);
             return;
         }
         else if (hash == Adler32Helper.GenerateAdler32_ASCII("GameTeamBoosterRequestAddGaugePacket"))
@@ -899,29 +1003,26 @@ public static class MultyPlayer
             var value = iPacket.ReadFloat();
             Console.WriteLine("GameTeamBoosterRequestAddGaugePacket, teams = {0}, value = {1}", team, value);
 
-            if (team == 1)
+            // 组队加速槽按队伍独立累计：普通组队是 1/2 两队，双人组队是 1..N 队
+            if (!room.IsValidTeam(team))
             {
-                room.redGauge += (value * 0.000125f / room.GetPlayerCount(team));
-                if (room.redGauge > 1f) room.redGauge = 1f;
-                using (OutPacket oPacket = new OutPacket("GameTeamBoosterSetGaugePacket"))
-                {
-                    oPacket.WriteByte(team);
-                    oPacket.WriteFloat(room.redGauge);
-                    BroadCast(roomId, oPacket, "", team);
-                }
-                if (room.redGauge == 1f) room.redGauge = 0f;
+                return; // 非法队伍号（含 team=0）直接忽略
             }
-            else if (team == 2)
+            int members = room.GetPlayerCount(team);
+            if (members < 1)
             {
-                room.blueGauge += (value * 0.000125f / room.GetPlayerCount(team));
-                if (room.blueGauge > 1f) room.blueGauge = 1f;
-                using (OutPacket oPacket = new OutPacket("GameTeamBoosterSetGaugePacket"))
-                {
-                    oPacket.WriteByte(team);
-                    oPacket.WriteFloat(room.blueGauge);
-                    BroadCast(roomId, oPacket, "", team);
-                }
-                if (room.blueGauge == 1f) room.blueGauge = 0f;
+                members = 1; // 防止除零（该队玩家已离场时仍可能收到残留包）
+            }
+            float gauge = room.AddTeamGauge(team, value * 0.000125f / members);
+            using (OutPacket oPacket = new OutPacket("GameTeamBoosterSetGaugePacket"))
+            {
+                oPacket.WriteByte(team);
+                oPacket.WriteFloat(gauge);
+                BroadCast(roomId, oPacket, "", team);
+            }
+            if (gauge >= 1f)
+            {
+                room.ResetTeamGauge(team);
             }
             return;
         }
@@ -945,7 +1046,7 @@ public static class MultyPlayer
             using (OutPacket oPacket = new OutPacket("GrChangeTeamPacketReply"))
             {
                 oPacket.WriteInt(player.ID);
-                oPacket.WriteByte(player.Team);
+                oPacket.WriteByte(room.WireTeam(player.Team));
                 Position(roomId, oPacket);
                 Parent.Client.Send(oPacket);
             }
@@ -1183,7 +1284,7 @@ public static class MultyPlayer
                 {
                     outPacket.WriteUInt(UserID);
                     outPacket.WriteInt(roomId);
-                    var channel = GameSupport.Channels.FirstOrDefault(c => c.Value.GameType == room.GameType).Key;
+                    var channel = GameSupport.FindChannelIndex(room.WireGameType != 0 ? room.WireGameType : room.GameType, room.DuoTeam);
                     outPacket.WriteInt(channel);
                     outPacket.WriteBool(room.Lock);
                     outPacket.WriteByte(1);
@@ -1197,12 +1298,12 @@ public static class MultyPlayer
             uint UserID = iPacket.ReadUInt();
             int roomId = RoomManager.TryGetRoomId(Parent.Client.Nickname);
             var room = RoomManager.GetRoom(roomId);
-            var channel = GameSupport.Channels.FirstOrDefault(c => c.Value.GameType == room.GameType).Key;
+            var channel = GameSupport.FindChannelIndex(room.WireGameType != 0 ? room.WireGameType : room.GameType, room.DuoTeam);
             using (OutPacket outPacket = new OutPacket("PrWhereAmI"))
             {
                 outPacket.WriteUInt(UserID);
                 outPacket.WriteInt(roomId);
-                outPacket.WriteByte(channel);
+                outPacket.WriteByte((byte)channel);
                 outPacket.WriteInt(0);
                 outPacket.WriteInt(0);
                 Parent.Client.Send(outPacket);
@@ -1345,6 +1446,7 @@ public static class MultyPlayer
         room.StartTicks = 0;
         room.StartedPlayerCount = 0;
         room.Ready = new Dictionary<string, bool>();
+        room.TeamGauge.Clear(); // 新一局重置各队组队加速槽
     }
 
     static void GrSlotDataPacket(int roomId, OutPacket outPacket, bool enter = false, string nickname = "")
@@ -1428,7 +1530,7 @@ public static class MultyPlayer
                 outPacket.WriteUInt(pConfig.Rider.RP);
                 if (room.GameType == 3 || room.GameType == 4)
                 {
-                    outPacket.WriteByte(p.Team);
+                    outPacket.WriteByte(room.WireTeam(p.Team));
                 }
                 else
                 {
@@ -1480,7 +1582,7 @@ public static class MultyPlayer
                 outPacket.WriteShort(a.Goggle);
                 if (room.GameType == 3 || room.GameType == 4)
                 {
-                    outPacket.WriteByte(a.Team);
+                    outPacket.WriteByte(room.WireTeam(a.Team));
                 }
                 else
                 {
@@ -1675,7 +1777,7 @@ public static class MultyPlayer
         }
         outPacket.WriteString(room.RoomName);
         outPacket.WriteString(room.LockPwd);
-        outPacket.WriteByte(room.GameType);
+        outPacket.WriteByte(room.ModeByte);
         outPacket.WriteByte(room.SpeedType); //7
         outPacket.WriteInt(0);
         outPacket.WriteByte(0);
@@ -1707,7 +1809,7 @@ public static class MultyPlayer
                 outPacket.WriteByte(3);
                 outPacket.WriteByte(0);
                 outPacket.WriteByte(0);
-                outPacket.WriteEncByte(room.GameType);
+                outPacket.WriteEncByte(room.ModeByte);
                 outPacket.WriteBytes(new byte[5]);
                 Parent.Client.Send(outPacket);
             }
@@ -1725,7 +1827,7 @@ public static class MultyPlayer
                 outPacket.WriteByte(2);
                 outPacket.WriteByte(0);
                 outPacket.WriteByte(0);
-                outPacket.WriteEncByte(room.GameType);
+                outPacket.WriteEncByte(room.ModeByte);
                 outPacket.WriteBytes(new byte[5]);
                 Parent.Client.Send(outPacket);
             }
@@ -1738,6 +1840,22 @@ public static class MultyPlayer
             {
                 room.RoomMaster = player.ID;
             }
+            if (room.DuoTeam)
+            {
+                // 双人组队：入座时已在 TryAddPlayer 里按格子顺序分配好队伍号（每队最多 DuoTeamSize 人），
+                // 这里不再强制改成红/蓝队，直接回执即可
+                Console.WriteLine("[DuoTeam] {0} 加入房间 {1}，格子 {2}，队伍 {3}", player.Nickname, roomId, slot, player.Team);
+                using (OutPacket outPacket = new OutPacket("ChJoinRoomReplyPacket"))
+                {
+                    outPacket.WriteByte(0);
+                    outPacket.WriteByte(1);
+                    outPacket.WriteByte(room.WireTeamCount); // 队伍数量：双人房 4 队，普通组队 2 队
+                    outPacket.WriteEncByte(room.ModeByte);
+                    outPacket.WriteBytes(new byte[5]);
+                    Parent.Client.Send(outPacket);
+                }
+                return;
+            }
             if (slot < 4)
             {
                 player.Team = 2;
@@ -1745,8 +1863,8 @@ public static class MultyPlayer
                 {
                     outPacket.WriteByte(0);
                     outPacket.WriteByte(1);
-                    outPacket.WriteByte(2);
-                    outPacket.WriteEncByte(room.GameType);
+                    outPacket.WriteByte(room.WireTeamCount);
+                    outPacket.WriteEncByte(room.ModeByte);
                     outPacket.WriteBytes(new byte[5]);
                     Parent.Client.Send(outPacket);
                 }
@@ -1759,8 +1877,8 @@ public static class MultyPlayer
                 {
                     outPacket.WriteByte(0);
                     outPacket.WriteByte(1);
-                    outPacket.WriteByte(2);
-                    outPacket.WriteEncByte(room.GameType);
+                    outPacket.WriteByte(room.WireTeamCount);
+                    outPacket.WriteEncByte(room.ModeByte);
                     outPacket.WriteBytes(new byte[5]);
                     Parent.Client.Send(outPacket);
                 }
@@ -1773,7 +1891,7 @@ public static class MultyPlayer
                     outPacket.WriteByte(1);
                     outPacket.WriteByte(0);
                     outPacket.WriteByte(0);
-                    outPacket.WriteEncByte(room.GameType);
+                    outPacket.WriteEncByte(room.ModeByte);
                     outPacket.WriteBytes(new byte[5]);
                     Parent.Client.Send(outPacket);
                 }
@@ -1792,7 +1910,7 @@ public static class MultyPlayer
                 outPacket.WriteByte(0);
                 outPacket.WriteByte(1);
                 outPacket.WriteByte(8);
-                outPacket.WriteEncByte(room.GameType);
+                outPacket.WriteEncByte(room.ModeByte);
                 outPacket.WriteBytes(new byte[5]);
                 Parent.Client.Send(outPacket);
             }
@@ -1890,6 +2008,12 @@ public static class MultyPlayer
                     goggleId = selector.GetRandomAccessoryId(targetChar.Goggles);
                 }
                 byte team = i < 4 ? (byte)2 : (byte)1;
+                // 双人组队：AI 不按固定红蓝队，而是按格子顺序自动入座并由格子推导队伍号，
+                // 这样 7 个 AI 能依次填满各队（每队 2 人），不会被「队伍已满」挡掉
+                if (room.DuoTeam)
+                {
+                    team = 0;
+                }
                 Ai ai = new Ai
                 {
                     Character = targetCharId,
@@ -1960,8 +2084,8 @@ public static class MultyPlayer
                     });
                 }
             }
-            byte slot0 = room.TrySetAi(Ais[0], 2);
-            byte slot1 = room.TrySetAi(Ais[1], 1);
+            byte slot0 = room.TrySetAi(Ais[0], room.DuoTeam ? (byte)0 : (byte)2);
+            byte slot1 = room.TrySetAi(Ais[1], room.DuoTeam ? (byte)0 : (byte)1);
             if (slot0 != 255 && slot1 != 255)
             {
                 var ai0 = RoomManager.TryGetSlotDetail(roomId, slot0) as Ai;
@@ -1977,7 +2101,7 @@ public static class MultyPlayer
                     oPacket.WriteShort(ai0.Balloon);
                     oPacket.WriteShort(ai0.HeadBand);
                     oPacket.WriteShort(ai0.Goggle);
-                    oPacket.WriteByte(ai0.Team);
+                    oPacket.WriteByte(room.WireTeam(ai0.Team));
                     oPacket.WriteInt(ai1.ID);
                     oPacket.WriteShort(ai1.Character);
                     oPacket.WriteShort(ai1.Rid);
@@ -1985,7 +2109,7 @@ public static class MultyPlayer
                     oPacket.WriteShort(ai1.Balloon);
                     oPacket.WriteShort(ai1.HeadBand);
                     oPacket.WriteShort(ai1.Goggle);
-                    oPacket.WriteByte(ai1.Team);
+                    oPacket.WriteByte(room.WireTeam(ai1.Team));
                     Position(roomId, oPacket);
                     BroadCast(roomId, oPacket);
                 }
@@ -2031,7 +2155,9 @@ public static class MultyPlayer
                         oPacket.WriteShort(ai2.Balloon);
                         oPacket.WriteShort(ai2.HeadBand);
                         oPacket.WriteShort(ai2.Goggle);
-                        oPacket.WriteByte(0);
+                        // 队伍号必须下发真实值：写死 0 会让客户端把该 AI 渲染成「无队伍」，
+                        // 双人组队下看起来就是「只有红蓝两色」，第三、四队永远不上色。
+                        oPacket.WriteByte(room.WireTeam(ai2.Team));
                         Position(roomId, oPacket);
                         BroadCast(roomId, oPacket);
                     }
@@ -2093,6 +2219,326 @@ public static class MultyPlayer
         }
     }
 
+    /// <summary>补齐 AI 成绩时，相邻两个 AI 之间拉开的时间间隔（毫秒）</summary>
+    const uint AiResultGapMs = 1500;
+
+    /// <summary>AI 里程连续多少份报告不再增长，就认为它到达了终点（报告约 6 秒一份）</summary>
+    const int AiStuckReportsToFinish = 2;
+
+    /// <summary>
+    /// 读秒窗口（毫秒）：赛道上出现第一个完赛者（玩家或 AI）就开始读秒，
+    /// 固定 10 秒后强制结算 —— 不管剩下的参赛者有没有跑完。
+    /// 这个值同时写进 state=3 包里的秒数字节，客户端读秒就是按它来的。
+    /// </summary>
+    const int CountdownWindowMs = 10000;
+
+    /// <summary>
+    /// 结算定时器比客户端读秒提前的毫秒数。
+    ///
+    /// 客户端读到 0 之后会停在赛道画面里等结算包，这时它的最后一秒音效会每帧重放
+    /// （就是「读秒声音频率巨高」），而画面又不动（就是「读完秒也不结算」）。
+    /// 提前 0.8 秒结算，客户端还没读到 0，音效和画面都不会卡在那一帧。
+    /// </summary>
+    const int SettleLeadMs = 800;
+
+    /// <summary>
+    /// 下发 GameControlPacket(state=3) 时的第二个字段。
+    ///
+    /// 官方抓包里这个字节永远是 0x64（=100），我们以前按「剩余秒数」写 10，结果读秒是出来了，
+    /// 但滴答声变成了每秒十几次 —— 说明客户端拿它当「音效节拍间隔」（单位约 10 毫秒，
+    /// 100 × 10 = 1000 毫秒 = 一秒滴一次），而不是倒计时长度。
+    /// 倒计时长度本来由后面的 EndTicks 决定，所以这里固定写官方的 100，声音就恢复正常频率。
+    /// </summary>
+    const byte CountdownSoundTick = 0x64;
+
+    static void WriteCountdownSeconds(OutPacket oPacket, int seconds)
+    {
+        oPacket.WriteByte(CountdownSoundTick);
+    }
+
+    /// <summary>
+    /// 开始读秒：广播 state=3（带剩余秒数 + 结束时刻），并挂上结算定时器。
+    /// 房间已经进入读秒/已结算时直接返回，保证一局只读一次秒。
+    /// </summary>
+    static void BeginCountdown(GameRoom room, int windowMs, string reason)
+    {
+        if (room == null || room.EndTicks != 0 || room.SettleTriggered)
+        {
+            return;
+        }
+
+        room.SnapshotMembers = DeepCopyMembers(room._IDs); // 结束瞬间拍快照
+        room.EndTicks = ConvertTick() + (uint)windowMs;
+
+        using (OutPacket oPacket = new OutPacket("GameControlPacket"))
+        {
+            oPacket.WriteInt(3);
+            WriteCountdownSeconds(oPacket, (windowMs + 999) / 1000);
+            oPacket.WriteUInt(room.EndTicks);
+            BroadCast(room.RoomId, oPacket);
+        }
+
+        int delay = Math.Max(500, windowMs - SettleLeadMs);
+        Set_settleTrigger(room, delay);
+        Console.WriteLine("[开始读秒] {0}：客户端显示 {1} 秒，{2} 毫秒后结算", reason, (windowMs + 999) / 1000, delay);
+    }
+
+    /// <summary>房间里所有人（玩家 + AI）是否都已经有成绩</summary>
+    static bool AllRacersFinished(GameRoom room)
+    {
+        if (room == null || room.TimeData == null)
+        {
+            return false;
+        }
+        int total = 0;
+        for (int i = 0; i < 8; i++)
+        {
+            var m = room._slots[i];
+            if (m == null || m is Close)
+            {
+                continue;
+            }
+            total++;
+            int id = m is Player pl ? pl.ID : (m is Ai ai0 ? ai0.ID : -1);
+            if (id < 0)
+            {
+                continue;
+            }
+            if (!room.TimeData.TryGetValue(id, out uint t) || t == uint.MaxValue)
+            {
+                return false;
+            }
+        }
+        return total > 0;
+    }
+
+    /// <summary>
+    /// 处理客户端的 AI 里程报告，并判断 AI 是否冲线。
+    ///
+    /// 包体：4 字节包头(hash) + 4 字节无用数据 + N 个 float（每个 AI 的赛道里程），N = AI 数量。
+    /// 客户端把 AI 跑到终点后就把它停在终点（里程不再增长），但不会给服务端发「AI 冲线」包，
+    /// 所以老版本里 AI 到终点以后既不进结算、也不会开始倒计时，只能干等玩家自己冲线。
+    ///
+    /// 判定规则：里程连续 <see cref="AiStuckReportsToFinish"/> 份报告不再增长（约 12 秒），
+    /// 且已经跑到本局最远里程的 90% 以上 —— 视为完赛，成绩取「里程最后一次增长的时刻」。
+    /// （用 90% 而不是 100%，是因为每个 AI 停在线前的位置不完全一样。）
+    /// </summary>
+    static void AiReportUpdate(GameRoom room, List<float> dists)
+    {
+        if (room == null || dists == null || dists.Count == 0)
+        {
+            return;
+        }
+
+        var ais = new List<Ai>();
+        for (byte i = 0; i < 8; i++)
+        {
+            if (room._slots[i] is Ai ai)
+            {
+                ais.Add(ai);
+            }
+        }
+        if (ais.Count == 0)
+        {
+            return;
+        }
+
+        if (room.AiTracks == null)
+        {
+            room.AiTracks = new Dictionary<int, AiTrack>();
+        }
+
+        uint nowTick = ConvertTick();
+        int n = Math.Min(ais.Count, dists.Count);
+        float maxDist = 0f;
+
+        // 1) 更新里程
+        for (int i = 0; i < n; i++)
+        {
+            var ai = ais[i];
+            float d = dists[i];
+            if (d > maxDist)
+            {
+                maxDist = d;
+            }
+            if (!room.AiTracks.TryGetValue(ai.ID, out AiTrack track))
+            {
+                room.AiTracks[ai.ID] = new AiTrack { Dist = d, LastGrowTick = nowTick };
+                continue;
+            }
+            if (d - track.Dist > 0.5f)
+            {
+                track.Dist = d;
+                track.LastGrowTick = nowTick;
+                track.StuckReports = 0;
+            }
+            else
+            {
+                track.StuckReports++;
+            }
+        }
+
+        // 2) 判定冲线（要等赛道跑到一定长度再判，避免开局静止被误判）
+        if (maxDist < 100f)
+        {
+            return;
+        }
+        for (int i = 0; i < n; i++)
+        {
+            var ai = ais[i];
+            if (!room.AiTracks.TryGetValue(ai.ID, out AiTrack track) || track.Finished)
+            {
+                continue;
+            }
+            if (track.StuckReports < AiStuckReportsToFinish)
+            {
+                // 已经贴着终点线（本局最远里程 97% 以上）的，停一份报告就算到终点，
+                // 否则要多等一份（约 6 秒）才能判定，玩家会觉得 AI 早就到了却一直不结算。
+                bool rightAtLine = track.StuckReports >= 1 && track.Dist >= maxDist * 0.97f;
+                if (!rightAtLine)
+                {
+                    continue;
+                }
+            }
+            if (track.Dist < maxDist * 0.85f)
+            {
+                continue; // 卡在半路（撞墙之类），不算完赛，交给结算前补成绩
+            }
+            if (track.LastGrowTick <= room.StartTicks)
+            {
+                continue;
+            }
+            track.Finished = true;
+            OnAiFinished(room, ai, track.LastGrowTick - room.StartTicks);
+        }
+
+        // 3) 就算没有新的 AI 冲线，也要每份报告检查一次收尾条件：
+        //    最后那几个 AI 若是卡在赛道里不动了，不能一直干等下去。
+        TryStartAiFinishCountdown(room);
+    }
+
+    /// <summary>AI 冲线：补发成绩、写入 TimeData；所有 AI 都到终点后开始收尾倒计时。</summary>
+    static void OnAiFinished(GameRoom room, Ai ai, uint time)
+    {
+        if (room == null || ai == null || time == 0)
+        {
+            return;
+        }
+        if (room.TimeData.ContainsKey(ai.ID))
+        {
+            return;
+        }
+        room.TimeData[ai.ID] = time;
+
+        using (OutPacket oPacket = new OutPacket("GameRaceTimePacket"))
+        {
+            oPacket.WriteInt(ai.ID);
+            oPacket.WriteUInt(time);
+            BroadCast(room.RoomId, oPacket);
+        }
+        Console.WriteLine("[AI 完赛] AI {0}（{1} 队）时间 {2}", ai.ID, room.WireTeam(ai.Team), time);
+        TryStartAiFinishCountdown(room);
+    }
+
+    /// <summary>
+    /// 只要赛道上出现第一个完赛者（玩家或 AI），就开始读秒。
+    ///
+    /// 之前是「等所有 AI 都到终点才开始读秒」，玩家看到 AI 停在终点线却毫无动静，
+    /// 以为比赛卡死了。现在第一个 AI 冲线就开读秒（窗口 <see cref="CountdownWindowMs"/>），
+    /// 玩家在这期间冲线、且全员都有成绩，就 3 秒后提前结算。
+    /// </summary>
+    static void TryStartAiFinishCountdown(GameRoom room)
+    {
+        if (room == null || room.EndTicks != 0 || room.SettleTriggered)
+        {
+            return;
+        }
+
+        bool anyFinished = false;
+        for (int i = 0; i < 8; i++)
+        {
+            var m = room._slots[i];
+            if (m == null || m is Close)
+            {
+                continue;
+            }
+            int id = m is Player pl ? pl.ID : (m is Ai ai0 ? ai0.ID : -1);
+            if (id < 0)
+            {
+                continue;
+            }
+            if (room.TimeData.TryGetValue(id, out uint t) && t != uint.MaxValue)
+            {
+                anyFinished = true;
+                break;
+            }
+        }
+        if (!anyFinished)
+        {
+            return;
+        }
+
+        BeginCountdown(room, CountdownWindowMs, "有参赛者到达终点");
+    }
+
+    /// <summary>
+    /// 结算前给「没在 10 秒窗口内到达终点」的 AI 补一个成绩。
+    ///
+    /// 客户端 AI 由本机模拟，速度通常比玩家慢，玩家的结算倒计时一结束，AI 的成绩还是 0xFFFFFFFF。
+    /// 客户端结算板只渲染有成绩的成员，于是双人组队结算里只出现玩家那一行，
+    /// 其余队伍一律 000（也就是「AI 不显示」）。这里按编号顺序把未完赛的 AI 排在所有完赛者之后，
+    /// 并补发 GameRaceTimePacket，让客户端也把 AI 当作到达终点，结算板和队伍积分才完整。
+    /// </summary>
+    static void PatchMissingAiResultTimes(GameRoom room, RoomMember[] members, Dictionary<int, uint> timeData)
+    {
+        if (room == null || members == null || timeData == null)
+        {
+            return;
+        }
+
+        // 基准：所有完赛者里最晚的成绩
+        uint baseTime = 0;
+        foreach (var kv in timeData)
+        {
+            if (kv.Value != uint.MaxValue && kv.Value > baseTime)
+            {
+                baseTime = kv.Value;
+            }
+        }
+        if (baseTime == 0)
+        {
+            return; // 无人完赛（比赛异常结束），保持全体 DNF
+        }
+
+        var pending = new List<Ai>();
+        foreach (RoomMember member in members)
+        {
+            if (member is Ai ai && (!timeData.TryGetValue(ai.ID, out uint t) || t == uint.MaxValue))
+            {
+                pending.Add(ai);
+            }
+        }
+        if (pending.Count == 0)
+        {
+            return;
+        }
+
+        pending.Sort((a, b) => a.ID.CompareTo(b.ID));
+        uint time = baseTime;
+        foreach (Ai ai in pending)
+        {
+            time += AiResultGapMs;
+            timeData[ai.ID] = time;
+            using (OutPacket oPacket = new OutPacket("GameRaceTimePacket"))
+            {
+                oPacket.WriteInt(ai.ID);
+                oPacket.WriteUInt(time);
+                BroadCast(room.RoomId, oPacket);
+            }
+            Console.WriteLine("[AI 成绩补齐] AI {0}（{1} 队）时间 {2}", ai.ID, room.WireTeam(ai.Team), time);
+        }
+    }
+
     static void GameResultPacket(GameRoom room, RoomMember[] members, Dictionary<int, uint> timeData)
     {
         int playerCount = 0;
@@ -2132,37 +2578,39 @@ public static class MultyPlayer
         }
         Console.WriteLine("第一名 ID: {0} Team: {1}", firstId, firstTeam);
 
-        int redTeam = 0;
-        int blueTeam = 0;
+        // 按队伍累计积分（普通组队是 1/2 两队，双人组队是 1..N 队，同一套逻辑）
+        Dictionary<byte, int> teamScores = new Dictionary<byte, int>();
         foreach (RoomMember member in members)
         {
+            byte memberTeam = 0;
+            int memberId = -1;
             if (member is Player p3)
             {
-                if (p3.Team == 2 && timeData[p3.ID] != uint.MaxValue)
-                {
-                    blueTeam += teamPoints[ranking[p3.ID]];
-                }
-                else if (p3.Team == 1 && timeData[p3.ID] != uint.MaxValue)
-                {
-                    redTeam += teamPoints[ranking[p3.ID]];
-                }
+                memberTeam = p3.Team;
+                memberId = p3.ID;
             }
-            if (member is Ai a3)
+            else if (member is Ai a3)
             {
-                if (a3.Team == 2 && timeData[a3.ID] != uint.MaxValue)
-                {
-                    blueTeam += teamPoints[ranking[a3.ID]];
-                }
-                else if (a3.Team == 1 && timeData[a3.ID] != uint.MaxValue)
-                {
-                    redTeam += teamPoints[ranking[a3.ID]];
-                }
+                memberTeam = a3.Team;
+                memberId = a3.ID;
             }
+
+            if (memberTeam == 0 || memberId < 0 || timeData[memberId] == uint.MaxValue)
+            {
+                continue; // 未组队 / 未完成比赛（DNF）不计分
+            }
+
+            teamScores.TryGetValue(memberTeam, out int score);
+            teamScores[memberTeam] = score + teamPoints[ranking[memberId]];
         }
+
+        int redTeam = teamScores.TryGetValue(1, out int r) ? r : 0;  // 普通组队：红队 = 1 队
+        int blueTeam = teamScores.TryGetValue(2, out int b) ? b : 0;  // 普通组队：蓝队 = 2 队
+        Console.WriteLine("队伍积分：{0}", string.Join(" / ", teamScores.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}队={kv.Value}")));
 
         using (OutPacket outPacket = new OutPacket("GameNextStagePacket"))
         {
-            outPacket.WriteByte(room.GameType);
+            outPacket.WriteByte(room.ModeByte);
             outPacket.WriteInt();
             outPacket.WriteInt();
             BroadCast(room.RoomId, outPacket);
@@ -2172,7 +2620,12 @@ public static class MultyPlayer
         {
             if (room.GameType == 3)
             {
-                if (redTeam == blueTeam)
+                if (room.DuoTeam)
+                {
+                    // 双人组队竞速：总分最高的队伍获胜（并列时取第一名所在队伍）
+                    outPacket.WriteByte(GetDuoWinnerTeam(teamScores, firstTeam));
+                }
+                else if (redTeam == blueTeam)
                 {
                     outPacket.WriteByte(firstTeam);
                 }
@@ -2183,6 +2636,7 @@ public static class MultyPlayer
             }
             else if (room.GameType == 4)
             {
+                // 道具组队：先到终点者所在队伍获胜（双人组队沿用同一规则）
                 outPacket.WriteByte(firstTeam);
             }
             else
@@ -2190,7 +2644,8 @@ public static class MultyPlayer
                 outPacket.WriteByte(0);
             }
 
-            outPacket.WriteInt(playerCount); // player count
+            // 条目总数 = 玩家 + AI：AI 也按「玩家条目」下发（见下面的 Ai 分支）
+            outPacket.WriteInt(playerCount + aiCount); // count
             foreach (RoomMember member in members)
             {
                 if (member is Player p4)
@@ -2214,7 +2669,9 @@ public static class MultyPlayer
                     outPacket.WriteInt(playerRanking);
                     if (room.GameType == 3 || room.GameType == 4)
                     {
-                        outPacket.WriteShort(2); //2
+                        // 组队模式填队伍数量：普通组队固定 2 队；
+                        // 双人组队按官方抓包（GameResultPacket 该字段为 0）保持 0，避免客户端按 2 队解析
+                        outPacket.WriteShort(room.DuoTeam ? (short)0 : (short)2);
                     }
                     else
                     {
@@ -2246,7 +2703,7 @@ public static class MultyPlayer
                     if (room.GameType == 3 || room.GameType == 4)
                     {
                         outPacket.WriteInt(playerPoint);
-                        outPacket.WriteByte(p4.Team); // Team
+                        outPacket.WriteByte(room.WireTeam(p4.Team)); // Team
                     }
                     else
                     {
@@ -2263,41 +2720,78 @@ public static class MultyPlayer
                     outPacket.WriteInt(p4Config.Rider.ClubMark_LOGO);
                     outPacket.WriteBytes(new byte[39]);
                 }
-            }
-
-            outPacket.WriteInt(aiCount); // AI count
-            foreach (RoomMember member in members)
-            {
-                if (member is Ai a4)
+                else if (member is Ai a5)
                 {
-                    outPacket.WriteInt(a4.ID);
-                    outPacket.WriteUInt(timeData[a4.ID]);
+                    // AI 也写成「玩家条目」（结构必须和玩家一模一样，217 字节）：
+                    // 客户端在组队模式（68 双人 / 3 竞速组队 / 4 道具组队）里并不解析单独的 AI 段，
+                    // 只按玩家条目逐条渲染。AI 留在 AI 段时整段被忽略 ——
+                    // 结算板/领奖台只剩自己一行、黄/绿/蓝队伍全是 000，队伍积分也不累加。
+                    outPacket.WriteInt(a5.ID);                  // id
+                    outPacket.WriteUInt(timeData[a5.ID]);       // 完赛时间
+                    outPacket.WriteByte();                      // 未知（同玩家）
+                    outPacket.WriteUShort((ushort)a5.Kart);     // 卡丁车
+                    int aiRanking = ranking[a5.ID];
+                    int aiPoint = timeData[a5.ID] == uint.MaxValue ? 0 : teamPoints[aiRanking];
+                    Console.WriteLine("AI {0} 排名 {1} 得分 {2}", a5.ID, aiRanking, aiPoint);
+                    outPacket.WriteInt(aiRanking);
+                    outPacket.WriteShort(room.GameType == 3 || room.GameType == 4
+                        ? (room.DuoTeam ? (short)0 : (short)2)
+                        : (short)0);
                     outPacket.WriteByte();
-
-                    // 获取 kart 属性值
-                    outPacket.WriteShort(a4.Kart);
-                    int AiRanking = ranking[a4.ID];
-                    int AiPoint = timeData[a4.ID] == uint.MaxValue ? 0 : teamPoints[AiRanking];
-                    Console.WriteLine("AI {0} 排名 {1} 得分 {2}", a4.ID, AiRanking, AiPoint);
-                    outPacket.WriteInt(AiRanking);
-                    outPacket.WriteShort(0);
+                    outPacket.WriteUInt(0); // RP
+                    outPacket.WriteUInt(0); // Earned RP
+                    outPacket.WriteUInt(0); // Earned Lucci
+                    outPacket.WriteUInt(0); // Lucci
+                    outPacket.WriteBytes(new byte[29]);
                     if (room.GameType == 3 || room.GameType == 4)
                     {
-                        outPacket.WriteByte(a4.Team); // Team
-                        outPacket.WriteInt(AiPoint);
+                        outPacket.WriteInt(aiPoint);
+                        outPacket.WriteByte(room.WireTeam(a5.Team)); // Team
                     }
                     else
                     {
-                        outPacket.WriteByte(0);
                         outPacket.WriteInt(0);
+                        outPacket.WriteByte(0);
                     }
+                    outPacket.WriteBytes(new byte[12]);
+                    outPacket.WriteInt(1);
+                    outPacket.WriteByte(0);
+                    outPacket.WriteUShort((ushort)a5.Character); // 角色
+                    outPacket.WriteBytes(new byte[49]);
+                    outPacket.WriteHexString("FF");
+                    outPacket.WriteBytes(new byte[37]);
+                    outPacket.WriteInt(0);                      // 俱乐部标志
+                    outPacket.WriteBytes(new byte[39]);
                 }
             }
+
+            // AI 段留空：AI 已并入上面的玩家条目
+            outPacket.WriteInt(0); // AI count
             Console.WriteLine("红队得分 {0} 蓝队得分 {1}", redTeam, blueTeam);
             outPacket.WriteBytes(new byte[34]);
             outPacket.WriteHexString("FF FF FF FF 00 00 00 00 00");
             BroadCast(room.RoomId, outPacket);
         }
+    }
+
+    // 双人组队竞速：取总分最高的队伍；并列时由第一名所在队伍获胜，再并列则取队号小的
+    static byte GetDuoWinnerTeam(Dictionary<byte, int> teamScores, byte firstTeam)
+    {
+        if (teamScores.Count == 0)
+        {
+            return firstTeam;
+        }
+        int best = teamScores.Values.Max();
+        var winners = teamScores.Where(kv => kv.Value == best).Select(kv => kv.Key).ToList();
+        if (winners.Count == 1)
+        {
+            return winners[0];
+        }
+        if (winners.Contains(firstTeam))
+        {
+            return firstTeam;
+        }
+        return winners.OrderBy(t => t).First();
     }
 
     static RoomMember[] DeepCopyMembers(RoomMember[] source)

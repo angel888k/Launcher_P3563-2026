@@ -13,6 +13,56 @@ namespace LoggerLibrary
         private readonly TextWriter _originalOut;
         private readonly StringBuilder _cache;
 
+        // ---- 自动落盘：把控制台每一行同时写进 AutoLogs\Server_时间.log ----
+        // 目的：联机时出问题（结算包异常、掉线等）不再依赖手动点「保存日志」，
+        // 事后直接看文件里的十六进制包就能定位。
+        private static StreamWriter _autoLog;
+        private static readonly object _autoLogLock = new object();
+        private static bool _autoLogOpened;
+        private static long _autoLogBytes;
+        private const long AutoLogMaxBytes = 40L * 1024 * 1024; // 单文件上限 40MB
+
+        private static void AutoLogLine(string line)
+        {
+            if (_autoLogBytes > AutoLogMaxBytes)
+            {
+                return;
+            }
+            try
+            {
+                lock (_autoLogLock)
+                {
+                    if (!_autoLogOpened)
+                    {
+                        _autoLogOpened = true;
+                        try
+                        {
+                            string dir = Path.Combine(AppContext.BaseDirectory, "AutoLogs");
+                            Directory.CreateDirectory(dir);
+                            string file = Path.Combine(dir, $"Server_{DateTime.Now:yyyyMMdd_HHmmss}.log");
+                            _autoLog = new StreamWriter(new FileStream(file, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), new UTF8Encoding(false))
+                            {
+                                AutoFlush = true
+                            };
+                        }
+                        catch
+                        {
+                            _autoLog = null;
+                        }
+                    }
+                    if (_autoLog != null)
+                    {
+                        _autoLog.WriteLine($"[{DateTime.Now:HH:mm:ss}] {line}");
+                        _autoLogBytes += line.Length + 12;
+                    }
+                }
+            }
+            catch
+            {
+                // 落盘失败不能影响主流程
+            }
+        }
+
         public string Cache => _cache.ToString();
 
         public void ClearCache() => _cache.Clear();
@@ -41,6 +91,7 @@ namespace LoggerLibrary
         {
             _originalOut.WriteLine(value);
             _cache.AppendLine(value);
+            AutoLogLine(value);
         }
 
         public static void SaveToFile()

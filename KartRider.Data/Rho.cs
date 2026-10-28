@@ -223,6 +223,9 @@ namespace KartRider
                     PackFolderInfo packFolderInfo1 = packFolderInfoQueue.Dequeue();
                     foreach (PackFileInfo packFileInfo in packFolderInfo1.GetFilesInfo())
                     {
+                        // 单个文件解析失败不再中断整份数据加载（补丁包里出现过畸形 XML，直接把整个 Data 加载打断）
+                        try
+                        {
                         string fullName = ReplacePath(packFileInfo.FullName);
                         if (fullName.Contains("flyingPet") && fullName.Contains($"param@{regionCode}.bml"))
                         {
@@ -907,7 +910,7 @@ namespace KartRider
                             DateTime now = DateTime.Now;
                             byte[] data = packFileInfo.GetData();
                             byte i = 1;
-                            using (MemoryStream stream = new MemoryStream(data))
+                            using (MemoryStream stream = new MemoryStream(GameSupport.StripXmlBom(data)))
                             {
                                 XDocument doc = XDocument.Load(stream);
 
@@ -916,11 +919,17 @@ namespace KartRider
                                 {
                                     XAttribute openPeriodAttr = channel.Attribute("openPeriod");
 
+                                    // gameType 68 是双人组队模式（官方抓包值，兼容早期自造的 5/6）：
+                                    // 内部归一化成组队模式的 3/4，仅用 DuoTeam 标记区分，保证后续分包/结算逻辑与组队模式一致；
+                                    // WireGameType 保留原始值，建房/房间信息里按它下发给客户端
+                                    byte channelGameType = byte.Parse(channel.Attribute("gameType").Value);
                                     var channelValue = new Channel
                                     {
                                         Name = channel.Attribute("name").Value,
                                         CreateSpeed = byte.Parse(channel.Attribute("createSpeed").Value),
-                                        GameType = byte.Parse(channel.Attribute("gameType").Value),
+                                        DuoTeam = DuoTeamMode.IsDuoGameType(channelGameType),
+                                        GameType = DuoTeamMode.ToBaseGameType(channelGameType),
+                                        WireGameType = channelGameType,
                                     };
 
                                     // 情况1：无openPeriod属性 → 直接加入结果
@@ -957,6 +966,11 @@ namespace KartRider
                                 XDocument doc = XDocument.Load(stream);
                                 Mix.ParseDocument(doc);
                             }
+                        }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[Data] 跳过无法解析的文件：{packFileInfo.FileName}（{ex.Message}）");
                         }
                     }
                     foreach (PackFolderInfo packFolderInfo2 in packFolderInfo1.GetFoldersInfo())

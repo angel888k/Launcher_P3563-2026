@@ -62,6 +62,18 @@ namespace Profile
         public string Proxy { get; set; } = "https://gh-proxy.com/";
 
         public string PatchUrl { get; set; } = "";
+
+        /// <summary>
+        /// 双人组队模式：是否在频道列表末尾自动追加「双人组队」频道（模式号 68）。
+        /// 关闭后只有 channel.xml 里显式配置 gameType=68 的频道才会启用双人组队。
+        /// </summary>
+        public bool DuoTeamChannel { get; set; } = true;
+
+        /// <summary>
+        /// 双人组队模式：每队人数上限（1~4），默认 2。8 个格子按「每队 N 人」顺序分组，
+        /// 例如 2 人 → 4 支队伍，4 人 → 2 支队伍（即原组队模式）。
+        /// </summary>
+        public byte DuoTeamSize { get; set; } = 2;
     }
 
     public class ProfileConfig
