@@ -91,7 +91,7 @@ namespace LoggerLibrary
         {
             _originalOut.WriteLine(value);
             _cache.AppendLine(value);
-            AutoLogLine(value);
+            // AutoLogLine(value);
         }
 
         public static void SaveToFile()
