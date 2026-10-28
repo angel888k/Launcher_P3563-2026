@@ -1,4 +1,4 @@
-using KartRider;
+﻿using KartRider;
 using KartRider.Common.Network;
 using KartRider.IO.Packet;
 using Profile;
@@ -250,12 +250,8 @@ namespace ExcData
                         oPacket.WriteShort(tempList[f].Booster);
                         oPacket.WriteByte(tempList[f].BoosterGrade);
                         oPacket.WriteShort(tempList[f].BoosterValue);
-                        oPacket.WriteShort(tempList[f].Coating);
-                        oPacket.WriteByte(0);
-                        oPacket.WriteShort(0);
-                        oPacket.WriteShort(tempList[f].TailLamp);
-                        oPacket.WriteByte(0);
-                        oPacket.WriteShort(0);
+                        V1CosmeticParts.WriteSlot(oPacket, 68, tempList[f].Coating);
+                        V1CosmeticParts.WriteSlot(oPacket, 69, tempList[f].TailLamp);
                     }
                     oPacket.WriteInt(0);
                     oPacket.WriteInt(0);

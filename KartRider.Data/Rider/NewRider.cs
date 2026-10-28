@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using KartRider.IO.Packet;
@@ -1001,9 +1001,11 @@ namespace RiderData
                         oPacket.WriteByte(0);
                         oPacket.WriteShort(-1);
                         oPacket.WriteShort(0);
-                        oPacket.WriteByte(0);
-                        oPacket.WriteByte(0);
-                        oPacket.WriteShort(0);
+                        bool cosmetic = V1CosmeticParts.IsCosmetic(itemCat);
+                        short cosmeticId = (short)tempList[f][0];
+                        oPacket.WriteByte((byte)(cosmetic ? 1 : 0));
+                        oPacket.WriteByte(cosmetic ? V1CosmeticParts.GetGrade(cosmeticId) : (byte)0);
+                        oPacket.WriteShort(cosmetic ? V1CosmeticParts.GetValue((short)itemCat, cosmeticId) : (short)0);
                     }
                     Parent.Client.Send(oPacket);
                 }
