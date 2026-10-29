@@ -2177,12 +2177,6 @@ public static class MultyPlayer
         }
     }
 
-    /// <summary>补齐 AI 成绩时，相邻两个 AI 之间拉开的时间间隔（毫秒）</summary>
-    const uint AiResultGapMs = 1500;
-
-    /// <summary>AI 里程连续多少份报告不再增长，就认为它到达了终点（报告约 6 秒一份）</summary>
-    const int AiStuckReportsToFinish = 2;
-
     /// <summary>
     /// 读秒窗口（毫秒）：赛道上出现第一个完赛者（玩家或 AI）就开始读秒，
     /// 固定 10 秒后强制结算 —— 不管剩下的参赛者有没有跑完。
@@ -2198,21 +2192,6 @@ public static class MultyPlayer
     /// 提前 0.8 秒结算，客户端还没读到 0，音效和画面都不会卡在那一帧。
     /// </summary>
     const int SettleLeadMs = 800;
-
-    /// <summary>
-    /// 下发 GameControlPacket(state=3) 时的第二个字段。
-    ///
-    /// 官方抓包里这个字节永远是 0x64（=100），我们以前按「剩余秒数」写 10，结果读秒是出来了，
-    /// 但滴答声变成了每秒十几次 —— 说明客户端拿它当「音效节拍间隔」（单位约 10 毫秒，
-    /// 100 × 10 = 1000 毫秒 = 一秒滴一次），而不是倒计时长度。
-    /// 倒计时长度本来由后面的 EndTicks 决定，所以这里固定写官方的 100，声音就恢复正常频率。
-    /// </summary>
-    const byte CountdownSoundTick = 0x64;
-
-    static void WriteCountdownSeconds(OutPacket oPacket, int seconds)
-    {
-        oPacket.WriteByte(CountdownSoundTick);
-    }
 
     /// <summary>
     /// 开始读秒：广播 state=3（带剩余秒数 + 结束时刻），并挂上结算定时器。
@@ -2231,7 +2210,7 @@ public static class MultyPlayer
         using (OutPacket oPacket = new OutPacket("GameControlPacket"))
         {
             oPacket.WriteInt(3);
-            WriteCountdownSeconds(oPacket, (windowMs + 999) / 1000);
+            oPacket.WriteByte(0);
             oPacket.WriteUInt(room.EndTicks);
             BroadCast(room.RoomId, oPacket);
         }
