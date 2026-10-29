@@ -19,7 +19,7 @@ namespace KartRider
     class Update
     {
         public static string owner = "yanygm";
-        public static string repo = "Launcher_V2";
+        public static string repo = "Launcher_P3563";
         static string name;
         static string filePath;
 
@@ -345,27 +345,32 @@ namespace KartRider
 
         public static async Task<apiUpdate> GetUpdateAsync()
         {
-            // API 地址
-            string url = "https://tcgapi.tiancity.com/tcgame/V2/apiUpdate?gameid=4";
+            // // API 地址
+            // string url = "https://tcgapi.tiancity.com/tcgame/V2/apiUpdate?gameid=4";
 
-            // 创建 HTTP 客户端
-            using HttpClient client = new HttpClient();
+            // // 创建 HTTP 客户端
+            // using HttpClient client = new HttpClient();
 
-            try
-            {
-                // 发送 GET 请求并获取响应字符串
-                string json = await client.GetStringAsync(url);
+            // try
+            // {
+            //     // 发送 GET 请求并获取响应字符串
+            //     string json = await client.GetStringAsync(url);
 
-                // 解析 JSON
-                apiUpdate data = JsonSerializer.Deserialize<apiUpdate>(json);
+            //     // 解析 JSON
+            //     apiUpdate data = JsonSerializer.Deserialize<apiUpdate>(json);
 
-                return data;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"请求或解析失败: {ex.Message}");
-                return null;
-            }
+            //     return data;
+            // }
+            // catch (Exception ex)
+            // {
+            //     Console.WriteLine($"请求或解析失败: {ex.Message}");
+            //     return null;
+            // }
+            string json = """
+            {"game_id":"4","game_name":"\u8dd1\u8dd1\u5361\u4e01\u8f66","version":"P3563","install_pack_time":"0000-00-00 00:00:00","update_time":"2026-10-15 13:50:41","download_prefix":"http:\/\/kartupdate.tiancity.cn\/patch\/ELYOHQDTXRJXTKE\/3457","update_prefix":"http:\/\/kartupdate.tiancity.cn\/patch_tcg\/XWGALHGKAHGAKSX","file":[{"game_id":"4","file_id":"13","file_name":"M01_full_20210511.txt","file_type":"txt","file_link":"M01_full_20210511.txt","file_md5":"6ed0b6f24048ccb96af138d12fd92e7c"}],"gameserver":[{"game_id":"4","server_id":"1","game_name":"\u8dd1\u8dd1\u5361\u4e01\u8f66","server_name":"\u53cc\u7ebf\u533a","server_status":"4","region_id":"11","service_number":"3"}],"proclist":["KK9KKK9KKK33KKXEKK33","KK9KKK9KKKX8KK9KKK2XKKA1","KK9MKKM3KKM2F8XA931226C72MKA9AAF","KK93KKAFKKA9KKAEKKMFKK29KKAE","93DD93A7","94X2AX11","KKM6KK93KKM3"],"sgk":["KKA6KKA9KK2XKKAEKKA9KKADKKAXKKA7KK23KKA9KKXEKKM3KK2XKKA9KKA7KK2MKKA9KK9XKKA9KKA8KKA1KK2MKKA9KK9MKKAFKK2XKKA9KKA7KKAMKKM9KK2F","KKAEKK2MKKAMKKADKKADKKXEKKMEKK2MKKM3KK2XKKA9KKA7KK2MKKA9KK9MKKAFKK2XKKA9KKA7KKAM","KKAEKK2MKKAMKKADKKADKKXEKKMEKK2MKKM3KK2XKKA9KKA7KK2MKKA9KK9MKKAFKK2XKKA9KKA7KKAMKKM9KK2F","KKAEKK2MKKAMKKADKKADKKXEKKMEKK2MKK97KK29KKA9KK2XKK24KKM4KKAEKKAAKKA1KK2XKKA8KKA7KK2MKKA4KKA1KKAEKK9KKK2XKKA1KKA3KKA9KK23KK23","KKA6KKA9KK2XKKAEKKA9KKADKK33KK3XKKXEKKM9KKAEKK29KKA8KK9KKK2XKKA1KKA3KKA9KK23KK23KKA9KK23","KKA6KKA9KK2XKKAEKKA9KKADKK33KK3XKKXEKKM9KKAEKK29KKA8KK9KKK2XKKA1KKA3KKA9KK23KK23KKM8KKA1KKAMKK29KKADKKA9KK23","KKA6KKA9KK2XKKAEKKA9KKADKK33KK3XKKXEKKM9KKAEKK29KKA8KK9KKK2XKKA1KKA3KKA9KK23KK23KKM8KKA1KKAMKK29KKADKKA9KK23KKM9KK2F","KKAEKK2MKKAMKKADKKADKKXEKKMEKK2MKKM1KK2KKKA9KKAEKK9KKK2XKKA1KKA3KKA9KK23KK23"]}
+            """;
+            apiUpdate data = JsonSerializer.Deserialize<apiUpdate>(json);
+            return data;
         }
     }
 

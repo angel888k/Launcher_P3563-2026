@@ -317,11 +317,6 @@ public static class MultyPlayer
         resendTimer.AutoReset = false;
         resendTimer.Start();
 
-        // 双人组队（以及普通组队/个人）里客户端 AI 跑得比玩家慢，10 秒结算窗口内往往还没到终点，
-        // 整局 AI 的成绩都是 0xFFFFFFFF（未完赛）→ 结算板只显示玩家一行、其他队伍全 0 分。
-        // 这里在结算前给未完赛的 AI 补一个成绩，并补发 GameRaceTimePacket 让客户端也认为它们到达终点。
-        PatchMissingAiResultTimes(room, menbers, timeData);
-
         InitRoom(room);
 
         GameResultPacket(room, menbers, timeData);
@@ -966,10 +961,11 @@ public static class MultyPlayer
             }
             room.TimeData.TryAdd(Id, Time);
             Console.WriteLine("GameAiGoalinPacket, Id = {0}, Time = {1}", Id, Time);
-            // 注意：这里原来「第一个 AI 冲线就开始 10 秒倒计时」，会把还在冲刺的玩家硬判未完赛
-            // （实测玩家离终点只差 400 米，10 秒后直接弹出结算且自己 0 分）。
-            // 现在改成：等所有 AI 都到终点，再给一个收尾倒计时；玩家在这期间冲线就提前结算。
-            TryStartAiFinishCountdown(room);
+            if (room.EndTicks == 0)
+            {
+                // Ai冲线：和「第一个 AI 冲线」走同一条路 —— 开始 10 秒读秒，到点就结算。
+                BeginCountdown(room, CountdownWindowMs, "Ai到达终点");
+            }
             return;
         }
         else if (hash == Adler32Helper.GenerateAdler32_ASCII("GameAiReportPacket"))
@@ -988,7 +984,6 @@ public static class MultyPlayer
             {
                 aiDists.Add(iPacket.ReadFloat());
             }
-            AiReportUpdate(room, aiDists);
             return;
         }
         else if (hash == Adler32Helper.GenerateAdler32_ASCII("GameTeamBoosterRequestAddGaugePacket"))
@@ -2281,262 +2276,6 @@ public static class MultyPlayer
         int delay = Math.Max(500, windowMs - SettleLeadMs);
         Set_settleTrigger(room, delay);
         Console.WriteLine("[开始读秒] {0}：客户端显示 {1} 秒，{2} 毫秒后结算", reason, (windowMs + 999) / 1000, delay);
-    }
-
-    /// <summary>房间里所有人（玩家 + AI）是否都已经有成绩</summary>
-    static bool AllRacersFinished(GameRoom room)
-    {
-        if (room == null || room.TimeData == null)
-        {
-            return false;
-        }
-        int total = 0;
-        for (int i = 0; i < 8; i++)
-        {
-            var m = room._slots[i];
-            if (m == null || m is Close)
-            {
-                continue;
-            }
-            total++;
-            int id = m is Player pl ? pl.ID : (m is Ai ai0 ? ai0.ID : -1);
-            if (id < 0)
-            {
-                continue;
-            }
-            if (!room.TimeData.TryGetValue(id, out uint t) || t == uint.MaxValue)
-            {
-                return false;
-            }
-        }
-        return total > 0;
-    }
-
-    /// <summary>
-    /// 处理客户端的 AI 里程报告，并判断 AI 是否冲线。
-    ///
-    /// 包体：4 字节包头(hash) + 4 字节无用数据 + N 个 float（每个 AI 的赛道里程），N = AI 数量。
-    /// 客户端把 AI 跑到终点后就把它停在终点（里程不再增长），但不会给服务端发「AI 冲线」包，
-    /// 所以老版本里 AI 到终点以后既不进结算、也不会开始倒计时，只能干等玩家自己冲线。
-    ///
-    /// 判定规则：里程连续 <see cref="AiStuckReportsToFinish"/> 份报告不再增长（约 12 秒），
-    /// 且已经跑到本局最远里程的 90% 以上 —— 视为完赛，成绩取「里程最后一次增长的时刻」。
-    /// （用 90% 而不是 100%，是因为每个 AI 停在线前的位置不完全一样。）
-    /// </summary>
-    static void AiReportUpdate(GameRoom room, List<float> dists)
-    {
-        if (room == null || dists == null || dists.Count == 0)
-        {
-            return;
-        }
-
-        var ais = new List<Ai>();
-        for (byte i = 0; i < 8; i++)
-        {
-            if (room._slots[i] is Ai ai)
-            {
-                ais.Add(ai);
-            }
-        }
-        if (ais.Count == 0)
-        {
-            return;
-        }
-
-        if (room.AiTracks == null)
-        {
-            room.AiTracks = new Dictionary<int, AiTrack>();
-        }
-
-        uint nowTick = ConvertTick();
-        int n = Math.Min(ais.Count, dists.Count);
-        float maxDist = 0f;
-
-        // 1) 更新里程
-        for (int i = 0; i < n; i++)
-        {
-            var ai = ais[i];
-            float d = dists[i];
-            if (d > maxDist)
-            {
-                maxDist = d;
-            }
-            if (!room.AiTracks.TryGetValue(ai.ID, out AiTrack track))
-            {
-                room.AiTracks[ai.ID] = new AiTrack { Dist = d, LastGrowTick = nowTick };
-                continue;
-            }
-            if (d - track.Dist > 0.5f)
-            {
-                track.Dist = d;
-                track.LastGrowTick = nowTick;
-                track.StuckReports = 0;
-            }
-            else
-            {
-                track.StuckReports++;
-            }
-        }
-
-        // 2) 判定冲线（要等赛道跑到一定长度再判，避免开局静止被误判）
-        if (maxDist < 100f)
-        {
-            return;
-        }
-        for (int i = 0; i < n; i++)
-        {
-            var ai = ais[i];
-            if (!room.AiTracks.TryGetValue(ai.ID, out AiTrack track) || track.Finished)
-            {
-                continue;
-            }
-            if (track.StuckReports < AiStuckReportsToFinish)
-            {
-                // 已经贴着终点线（本局最远里程 97% 以上）的，停一份报告就算到终点，
-                // 否则要多等一份（约 6 秒）才能判定，玩家会觉得 AI 早就到了却一直不结算。
-                bool rightAtLine = track.StuckReports >= 1 && track.Dist >= maxDist * 0.97f;
-                if (!rightAtLine)
-                {
-                    continue;
-                }
-            }
-            if (track.Dist < maxDist * 0.85f)
-            {
-                continue; // 卡在半路（撞墙之类），不算完赛，交给结算前补成绩
-            }
-            if (track.LastGrowTick <= room.StartTicks)
-            {
-                continue;
-            }
-            track.Finished = true;
-            OnAiFinished(room, ai, track.LastGrowTick - room.StartTicks);
-        }
-
-        // 3) 就算没有新的 AI 冲线，也要每份报告检查一次收尾条件：
-        //    最后那几个 AI 若是卡在赛道里不动了，不能一直干等下去。
-        TryStartAiFinishCountdown(room);
-    }
-
-    /// <summary>AI 冲线：补发成绩、写入 TimeData；所有 AI 都到终点后开始收尾倒计时。</summary>
-    static void OnAiFinished(GameRoom room, Ai ai, uint time)
-    {
-        if (room == null || ai == null || time == 0)
-        {
-            return;
-        }
-        if (room.TimeData.ContainsKey(ai.ID))
-        {
-            return;
-        }
-        room.TimeData[ai.ID] = time;
-
-        using (OutPacket oPacket = new OutPacket("GameRaceTimePacket"))
-        {
-            oPacket.WriteInt(ai.ID);
-            oPacket.WriteUInt(time);
-            BroadCast(room.RoomId, oPacket);
-        }
-        Console.WriteLine("[AI 完赛] AI {0}（{1} 队）时间 {2}", ai.ID, room.WireTeam(ai.Team), time);
-        TryStartAiFinishCountdown(room);
-    }
-
-    /// <summary>
-    /// 只要赛道上出现第一个完赛者（玩家或 AI），就开始读秒。
-    ///
-    /// 之前是「等所有 AI 都到终点才开始读秒」，玩家看到 AI 停在终点线却毫无动静，
-    /// 以为比赛卡死了。现在第一个 AI 冲线就开读秒（窗口 <see cref="CountdownWindowMs"/>），
-    /// 玩家在这期间冲线、且全员都有成绩，就 3 秒后提前结算。
-    /// </summary>
-    static void TryStartAiFinishCountdown(GameRoom room)
-    {
-        if (room == null || room.EndTicks != 0 || room.SettleTriggered)
-        {
-            return;
-        }
-
-        bool anyFinished = false;
-        for (int i = 0; i < 8; i++)
-        {
-            var m = room._slots[i];
-            if (m == null || m is Close)
-            {
-                continue;
-            }
-            int id = m is Player pl ? pl.ID : (m is Ai ai0 ? ai0.ID : -1);
-            if (id < 0)
-            {
-                continue;
-            }
-            if (room.TimeData.TryGetValue(id, out uint t) && t != uint.MaxValue)
-            {
-                anyFinished = true;
-                break;
-            }
-        }
-        if (!anyFinished)
-        {
-            return;
-        }
-
-        BeginCountdown(room, CountdownWindowMs, "有参赛者到达终点");
-    }
-
-    /// <summary>
-    /// 结算前给「没在 10 秒窗口内到达终点」的 AI 补一个成绩。
-    ///
-    /// 客户端 AI 由本机模拟，速度通常比玩家慢，玩家的结算倒计时一结束，AI 的成绩还是 0xFFFFFFFF。
-    /// 客户端结算板只渲染有成绩的成员，于是双人组队结算里只出现玩家那一行，
-    /// 其余队伍一律 000（也就是「AI 不显示」）。这里按编号顺序把未完赛的 AI 排在所有完赛者之后，
-    /// 并补发 GameRaceTimePacket，让客户端也把 AI 当作到达终点，结算板和队伍积分才完整。
-    /// </summary>
-    static void PatchMissingAiResultTimes(GameRoom room, RoomMember[] members, Dictionary<int, uint> timeData)
-    {
-        if (room == null || members == null || timeData == null)
-        {
-            return;
-        }
-
-        // 基准：所有完赛者里最晚的成绩
-        uint baseTime = 0;
-        foreach (var kv in timeData)
-        {
-            if (kv.Value != uint.MaxValue && kv.Value > baseTime)
-            {
-                baseTime = kv.Value;
-            }
-        }
-        if (baseTime == 0)
-        {
-            return; // 无人完赛（比赛异常结束），保持全体 DNF
-        }
-
-        var pending = new List<Ai>();
-        foreach (RoomMember member in members)
-        {
-            if (member is Ai ai && (!timeData.TryGetValue(ai.ID, out uint t) || t == uint.MaxValue))
-            {
-                pending.Add(ai);
-            }
-        }
-        if (pending.Count == 0)
-        {
-            return;
-        }
-
-        pending.Sort((a, b) => a.ID.CompareTo(b.ID));
-        uint time = baseTime;
-        foreach (Ai ai in pending)
-        {
-            time += AiResultGapMs;
-            timeData[ai.ID] = time;
-            using (OutPacket oPacket = new OutPacket("GameRaceTimePacket"))
-            {
-                oPacket.WriteInt(ai.ID);
-                oPacket.WriteUInt(time);
-                BroadCast(room.RoomId, oPacket);
-            }
-            Console.WriteLine("[AI 成绩补齐] AI {0}（{1} 队）时间 {2}", ai.ID, room.WireTeam(ai.Team), time);
-        }
     }
 
     static void GameResultPacket(GameRoom room, RoomMember[] members, Dictionary<int, uint> timeData)
