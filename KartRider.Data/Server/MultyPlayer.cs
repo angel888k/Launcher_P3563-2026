@@ -280,43 +280,6 @@ public static class MultyPlayer
             BroadCast(room.RoomId, outPacket);
         }
 
-        // 兜底：客户端偶尔读完秒会停在赛道画面不动（收到 state=4 也不切场景）。
-        // 1.8 秒后再补一次 state=4 + GameNextStagePacket，把它推去结算板；
-        // 不重发 GameResultPacket，避免重复算 RP/金币。
-        int retryRoomId = room.RoomId;
-        byte retryModeByte = room.ModeByte;
-        var resendTimer = new System.Timers.Timer(1800);
-        resendTimer.Elapsed += (s, _e) =>
-        {
-            try
-            {
-                using (OutPacket retry = new OutPacket("GameControlPacket"))
-                {
-                    retry.WriteInt(4);
-                    retry.WriteByte(0);
-                    retry.WriteUInt(settleTick);
-                    BroadCast(retryRoomId, retry);
-                }
-                using (OutPacket stage = new OutPacket("GameNextStagePacket"))
-                {
-                    stage.WriteByte(retryModeByte);
-                    stage.WriteInt();
-                    stage.WriteInt();
-                    BroadCast(retryRoomId, stage);
-                }
-                Console.WriteLine("[结算重发] 补发 state=4 + GameNextStagePacket 推动客户端进入结算板");
-            }
-            catch { }
-            finally
-            {
-                var tmr = (System.Timers.Timer)s;
-                tmr.Stop();
-                tmr.Dispose();
-            }
-        };
-        resendTimer.AutoReset = false;
-        resendTimer.Start();
-
         InitRoom(room);
 
         GameResultPacket(room, menbers, timeData);
